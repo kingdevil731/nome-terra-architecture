@@ -186,6 +186,15 @@ not. That is backwards — scoring is the part players would notice being wrong.
 | Scoring engine test suite                        | Not built                   |
 | Matchmaking beyond room codes                    | Not started                 |
 
+## Documents
+
+|                                          |                                                                                     |
+| ---------------------------------------- | ----------------------------------------------------------------------------------- |
+| [Realtime model](docs/realtime-model.md) | Authority, room lifecycle, state ownership, the Redis store and its concurrency gap |
+| [Decisions](docs/decisions.md)           | Each choice with the alternative rejected and the cost accepted                     |
+
+---
+
 ## Repository note
 
 This repository contains architecture documentation only. The implementation is
