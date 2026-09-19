@@ -1,128 +1,192 @@
 # Nome Terra
 
-Realtime multiplayer word game built with event-driven architecture.
+Architecture showcase for a realtime multiplayer word game. The implementation is
+private; this repository documents the system design.
 
-> Public architecture showcase for a private production project.
-> This repository focuses on system design, gameplay architecture and engineering decisions rather than full source distribution.
+**Live:** [nometerra.kingdevil731.dev](https://nometerra.kingdevil731.dev) (beta)
 
-## Live Application
+---
 
-[Nome Terra(beta)](https://nometerra.kingdevil731.dev)
+## The game
 
-## Overview
+Players join a room, vote on which categories to play, receive a random letter,
+and submit one answer per category under a timer. Everyone then reviews everyone
+else's answers and votes out invalid ones. Scores account for unique answers,
+duplicates between players, and entries voted invalid. Repeat across rounds and
+seasons.
 
-Nome Terra is a multiplayer word game where players join a shared room, vote on game columns, receive a random letter, submit answers under time pressure, review responses, vote invalid entries, and accumulate scores across rounds.
+It is the Portuguese/Brazilian game _Stop!_ — known locally as Nome Terra — which
+matters architecturally because the rules are fixed and well known. Players
+notice immediately if scoring is wrong, and a scoring disagreement mid-round is
+the failure that loses a lobby.
 
-Explores:
+## Why the architecture is shaped this way
 
-- Realtime multiplayer systems
-- Event-driven architecture
-- Shared state synchronization
-- Gameplay and scoring logic
-- Interactive product design
+Three properties drive everything:
 
-## Core Features
+**Scoring must be identical for every player.** Duplicate detection is inherently
+global — whether your answer scores full or half depends on what everyone else
+wrote. No client can compute it correctly, so scoring is server-authoritative
+with no exception.
 
-- Multiplayer rooms and lobby flow
-- Realtime synchronized gameplay rounds
-- Column proposal and voting
-- Submission and scoring engine
-- Review phase with invalid-answer voting
-- Shared leaderboards
-- Reconnection handling
-- Presence synchronization
+**Rounds are timed, so latency is visible.** A player typing at 1.8 seconds
+remaining expects their answer to count. The submission path is the only place in
+the system where responsiveness is allowed to complicate the design.
 
-## High-Level Architecture
+**Players drop and return.** Mobile browsers background aggressively, and a
+player who reconnects mid-round must land back in the correct phase with their
+own submissions intact, not in a fresh lobby.
 
-Players
-↓
-Socket.IO Gateway
-↓
-Room Service
-↓
-Game Engine
-↓
-Scoring Logic
+## Shape
 
-## Architectural Principles
+```mermaid
+flowchart TB
+    subgraph nodes[Backend instances]
+        N1[Node 1<br/>Socket.IO]
+        N2[Node 2<br/>Socket.IO]
+    end
 
-### Server-authoritative state
+    C1[Client] --> N1
+    C2[Client] --> N2
 
-Game progression and scoring coordinated server-side to preserve consistency.
+    N1 <-->|@socket.io/redis-adapter<br/>pub/sub fanout| RD[(Redis)]
+    N2 <-->|""| RD
 
-### Event-driven communication
+    RD -.->|RoomRepo<br/>room state + TTL| RD
 
-Example events:
+    N1 --> PG[(PostgreSQL<br/>history, seasons, stats)]
+    N2 --> PG
 
-- room:create
-- room:join
-- game:start
-- round:submit
-- round:voteInvalid
-- round:finalize
+    SH[["@nome-terra/shared<br/>socket contracts, DTOs, Zod"]]
+    C1 --- SH
+    N1 --- SH
+```
 
-### Shared game-core separation
+pnpm workspace with three packages: `nome-terra-backend`, `nome-terra-web`
+(Next.js/React), and `nome-terra-shared`.
 
-Layers:
+## Three things worth reading about
 
-- Socket transport
-- Room orchestration
-- Game core / scoring logic
+### Room state lives in Redis behind a repository interface
 
-## Gameplay Flow
+Room state is not in process memory. `RoomRepo` is an interface with two
+implementations — `InMemoryRoomRepo` for local development and `RedisRoomRepo`
+keyed by room ID with a code index and a TTL — selected at boot.
 
-Create Room
-↓
-Players Join
-↓
-Columns Voting
-↓
-Game Starts
-↓
-Letter Generated
-↓
-Timed Submission
-↓
-Review / Voting
-↓
-Scoring
-↓
-Next Round
+The TTL is the part that earns its place. Abandoned rooms are the default outcome
+in a casual multiplayer game: someone creates a lobby, nobody joins, they close
+the tab. Without expiry that accumulates forever, and explicit cleanup means
+detecting abandonment, which is exactly the thing that is hard when players
+disconnect and return legitimately. Letting Redis expire the key sidesteps the
+detection problem.
 
-## Technical Challenges
+→ [Realtime model](docs/realtime-model.md)
 
-- Multiplayer state synchronization
-- Responsiveness vs correctness
-- Duplicate events
-- Reconnect recovery
-- Race-condition edge cases
+### Production refuses to degrade silently
 
-## Stack
+Both the socket adapter and the room repository check for `REDIS_URL` and take
+different paths by environment:
 
-Backend:
+```ts
+if (!env.REDIS_URL) {
+  if (env.isProduction) {
+    console.error(
+      "[repo] production fallback prevented: Redis room repo requires REDIS_URL",
+    );
+    throw new Error("REDIS_URL_REQUIRED_FOR_PRODUCTION_ROOM_REPO");
+  }
+  console.warn(
+    "[repo] Redis room repo disabled; using InMemoryRoomRepo for non-production",
+  );
+  return new InMemoryRoomRepo();
+}
+```
 
-- Node.js
-- TypeScript
-- Socket.IO
-- PostgreSQL
-- Redis
-- Docker
+The in-memory fallback is a genuine convenience locally — no Redis needed to run
+the game. In production the same fallback is a trap: the server boots, works
+correctly under one instance, and breaks in a way that looks like random room
+loss the moment a second instance exists or the process restarts. Crashing at
+boot is louder and cheaper than debugging that.
 
-Frontend:
+→ [Engineering decisions](docs/decisions.md)
 
-- Next.js
-- React
+### Every client-to-server event is acknowledged
 
-## Architecture Metrics
+Socket handlers are wrapped so a thrown error becomes a structured negative
+acknowledgement rather than a lost event:
 
-- Realtime Architecture: Socket.IO
-- State Model: Server-Authoritative
-- Multiplayer: Room-Based
-- Game Logic: Shared Game Core
+```ts
+export function wrapAck<TPayload, TAck = unknown>(
+  fn: (payload: TPayload, ack?: (res: TAck) => void) => Promise<void>,
+) {
+  return (payload: TPayload, ack?: (res: TAck) => void) => {
+    fn(payload, ack).catch((e) => {
+      ack?.({ ok: false, error: (e as Error).message || "UNKNOWN" } as TAck);
+    });
+  };
+}
+```
 
-## Future Scaling
+Fire-and-forget emits are the standard way realtime games become unexplainable.
+A submission that vanishes with no error leaves the client showing a state the
+server does not have, and the player finds out at scoring. Nine lines make every
+failure addressable at the call site.
 
-- Redis adapter for horizontal scaling
-- Gameplay analytics
-- Persistent room-state strategies
-- Matchmaking evolution
+Socket event contracts (`ClientToServerEvents`, `ServerToClientEvents`) are typed
+in `@nome-terra/shared` and imported by both sides, so an event name or payload
+change is a compile error rather than a silent no-op.
+
+## Structure
+
+```
+nome-terra-backend/src/
+  realtime/
+    socketServer.ts          adapter setup, boot
+    gateways/gameGateway.ts
+    gateways/handlers/       lobby · rooms · round · game · disconnect
+    context/socketRegistry.ts
+    redis/redisClient.ts
+  modules/game/
+    repositories/            roomRepo · redisRoomRepo · createRoomRepo
+    services/                seasonService · playerSeasonStatsService
+    history/ playerProfile/ stats/
+  api/game/                  rooms · seasons · stats · social · history · profile
+```
+
+Handlers are split by lifecycle stage rather than kept in one connection handler,
+because the round handlers are where the real complexity is and they should not
+share a file with lobby chat.
+
+Alongside the game: seasons, player profiles, per-season stats, match history,
+social features, analytics, and an OpenAPI-documented REST surface for everything
+that is not realtime.
+
+## Known limitations
+
+**Room writes are not version-guarded.** `RedisRoomRepo` uses `MULTI` for
+atomic multi-key writes, but room mutation is read-modify-write with no `WATCH`
+or version field. Two instances handling concurrent submissions to the same room
+can lose an update. In practice a room's players are usually on one instance and
+the window is small, but this is the thing that would need fixing before running
+multiple instances under real load — and it is the one place where the
+horizontal-scaling story is currently incomplete.
+
+**Test coverage is uneven.** Auth, error handling, request logging, health check
+and the OpenAPI router are tested; the scoring engine and round lifecycle are
+not. That is backwards — scoring is the part players would notice being wrong.
+
+## Roadmap
+
+|                                                  | Status                      |
+| ------------------------------------------------ | --------------------------- |
+| Realtime rounds, voting, scoring, seasons, stats | Live in beta                |
+| Redis adapter for multi-instance fanout          | Built                       |
+| Redis-backed room state with TTL                 | Built                       |
+| Optimistic concurrency on room writes            | Not built — see limitations |
+| Scoring engine test suite                        | Not built                   |
+| Matchmaking beyond room codes                    | Not started                 |
+
+## Repository note
+
+This repository contains architecture documentation only. The implementation is
+private.
