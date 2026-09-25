@@ -36,7 +36,7 @@ flowchart TB
     W[web · Next.js] --> N1
     M[mobile · Expo] --> N2
 
-    N1 <-->|@socket.io/redis-adapter| RD[(Redis)]
+    N1 <-->|"@socket.io/redis-adapter"| RD[(Redis)]
     N2 <-->|room state · TTL · round lock| RD
 
     N1 --> PG[(PostgreSQL<br/>history · seasons · stats)]
