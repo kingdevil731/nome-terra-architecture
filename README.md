@@ -20,24 +20,11 @@ matters architecturally because the rules are fixed and well known. Players
 notice immediately if scoring is wrong, and a scoring disagreement mid-round is
 the failure that loses a lobby.
 
-## Why the architecture is shaped this way
-
-Three properties drive everything:
-
-**Scoring must be identical for every player.** Duplicate detection is inherently
-global — whether your answer scores full or half depends on what everyone else
-wrote. No client can compute it correctly, so scoring is server-authoritative
-with no exception.
-
-**Rounds are timed, so latency is visible.** A player typing at 1.8 seconds
-remaining expects their answer to count. The submission path is the only place in
-the system where responsiveness is allowed to complicate the design.
-
-**Players drop and return.** Mobile browsers background aggressively, and a
-player who reconnects mid-round must land back in the correct phase with their
-own submissions intact, not in a fresh lobby.
-
 ## Shape
+
+Turborepo with pnpm workspaces. Four packages: `nome-terra-backend` (Express,
+Socket.IO, Prisma), `nome-terra-web` (Next.js), `nome-terra-shared`, and
+`nome-terra-mobile` (Expo Router, not yet in the workspace build).
 
 ```mermaid
 flowchart TB
@@ -46,46 +33,97 @@ flowchart TB
         N2[Node 2<br/>Socket.IO]
     end
 
-    C1[Client] --> N1
-    C2[Client] --> N2
+    W[web · Next.js] --> N1
+    M[mobile · Expo] --> N2
 
-    N1 <-->|@socket.io/redis-adapter<br/>pub/sub fanout| RD[(Redis)]
-    N2 <-->|""| RD
+    N1 <-->|@socket.io/redis-adapter| RD[(Redis)]
+    N2 <-->|room state · TTL · round lock| RD
 
-    RD -.->|RoomRepo<br/>room state + TTL| RD
-
-    N1 --> PG[(PostgreSQL<br/>history, seasons, stats)]
+    N1 --> PG[(PostgreSQL<br/>history · seasons · stats)]
     N2 --> PG
 
-    SH[["@nome-terra/shared<br/>socket contracts, DTOs, Zod"]]
-    C1 --- SH
-    N1 --- SH
+    GC[["@nome-terra/shared<br/>game-core · socket contracts"]]
+    W --- GC
+    M --- GC
+    N1 --- GC
 ```
-
-pnpm workspace with three packages: `nome-terra-backend`, `nome-terra-web`
-(Next.js/React), and `nome-terra-shared`.
 
 ## Three things worth reading about
 
-### Room state lives in Redis, behind a repository interface and a lock
+### 1. The rules are a pure package both sides import
 
-Room state is not in process memory. `RoomRepo` is an interface with two
-implementations — `InMemoryRoomRepo` for local development and `RedisRoomRepo`
-keyed by room ID with a code index and a TTL — selected at boot.
+`game-core` is the layer this design rests on. Eight modules — `scoring`,
+`grouping`, `review`, `validate`, `normalize`, `letters`, `stop`, `blocklist` —
+with zero runtime dependencies and a hard constraint stated at the top of the
+package:
 
-The TTL is the part that earns its place. Abandoned rooms are the default outcome
-in a casual multiplayer game: someone creates a lobby, nobody joins, they close
-the tab. Without expiry that accumulates forever, and explicit cleanup means
-detecting abandonment, which is exactly the thing that is hard when players
-disconnect and return legitimately. Letting Redis expire the key sidesteps the
-detection problem.
+> No `Date.now`, no `Math.random`, no I/O, no framework imports: time and
+> randomness are injected so every rule is deterministically testable and any
+> disputed round is reproducible from its persisted seed.
+
+Both the server and the clients import it, and nothing in it may be
+reimplemented anywhere else. That is what stops the classic multiplayer failure
+where the client's idea of a score and the server's slowly diverge, because there
+is only one implementation of the rules in the system.
+
+Injecting the randomness is the part that earns its place. A round's letter comes
+from a seed that is persisted, so a player disputing a result is not a matter of
+opinion — the round can be replayed exactly. Every module has its own test file.
 
 → [Realtime model](docs/realtime-model.md)
 
-### Production refuses to degrade silently
+### 2. Room writes are serialised by an explicit lock, and the code says so
 
-Both the socket adapter and the room repository check for `REDIS_URL` and take
-different paths by environment:
+Room mutation is read-modify-write and the store has no version field. Instead of
+versioning the store, every write path takes a distributed mutex — `SET NX PX`
+with a random token, released through a Lua compare-and-delete so a holder whose
+lock has already expired cannot delete a lock another instance now owns.
+
+The discipline is visible in the naming. Entry points call
+`acquireRoundLockWaiting(roomId)`; internal operations that assume the lock is
+already held are named for it — `startGameWithLockHeld`, `endRoundWithLockHeld`,
+`finalizeRoundWithLockHeld`, `advanceReviewWithLockHeld` and five more. You
+cannot call one by accident and not notice.
+
+It is not only `GameService`. `RoomService`, `LobbyService` and `PresenceService`
+take the same lock, and there is a test asserting exactly why:
+
+> Every service that writes a room takes the same round lock GameService does.
+> Redis hands each caller its own copy, so an unlocked write that read before a
+> locked one saved puts the old room back.
+
+→ [Engineering decisions](docs/decisions.md)
+
+### 3. Nothing a client sends happens twice
+
+`IdempotencyStore.once(key, fn)` runs an action once and replays the stored
+result for a repeated key. A duplicate `round:stop` from a double-tap or a
+retried emit is a no-op rather than a second state transition.
+
+That pairs with acknowledgements on the socket layer. Handlers are wrapped so a
+thrown error becomes a structured negative ack rather than a lost event:
+
+```ts
+export function wrapAck<TPayload, TAck = unknown>(
+  fn: (payload: TPayload, ack?: (res: TAck) => void) => Promise<void>,
+) {
+  return (payload: TPayload, ack?: (res: TAck) => void) => {
+    fn(payload, ack).catch((e) => {
+      ack?.({ ok: false, error: (e as Error).message || "UNKNOWN" } as TAck);
+    });
+  };
+}
+```
+
+Fire-and-forget emits are how realtime games become unexplainable: a submission
+vanishes with no error, the client shows state the server does not have, and the
+player finds out at scoring. Acks make the failure addressable at the call site;
+idempotency makes the retry safe.
+
+## Production refuses to degrade silently
+
+Both the socket adapter and the room repository check for `REDIS_URL` and behave
+differently by environment:
 
 ```ts
 if (!env.REDIS_URL) {
@@ -102,106 +140,61 @@ if (!env.REDIS_URL) {
 }
 ```
 
-The in-memory fallback is a genuine convenience locally — no Redis needed to run
-the game. In production the same fallback is a trap: the server boots, works
-correctly under one instance, and breaks in a way that looks like random room
-loss the moment a second instance exists or the process restarts. Crashing at
-boot is louder and cheaper than debugging that.
+The in-memory fallback is a real convenience locally. In production the same
+fallback is a trap: the server boots, looks healthy, works under one instance,
+and loses rooms the moment a second appears or the process restarts. Crashing at
+boot is louder and cheaper than debugging that from a bug report.
 
-→ [Engineering decisions](docs/decisions.md)
+## Testing
 
-### Every client-to-server event is acknowledged
+78 test files. The weighting is deliberate: the pure rules layer is covered
+module by module, and the stateful paths are covered by behaviour — reconnection,
+presence lifecycle, seat holds, idle detection, rematch, under-two-player
+shutdown, abandoned-room outcomes, and a dedicated lock race test.
 
-Socket handlers are wrapped so a thrown error becomes a structured negative
-acknowledgement rather than a lost event:
-
-```ts
-export function wrapAck<TPayload, TAck = unknown>(
-  fn: (payload: TPayload, ack?: (res: TAck) => void) => Promise<void>,
-) {
-  return (payload: TPayload, ack?: (res: TAck) => void) => {
-    fn(payload, ack).catch((e) => {
-      ack?.({ ok: false, error: (e as Error).message || "UNKNOWN" } as TAck);
-    });
-  };
-}
-```
-
-Fire-and-forget emits are the standard way realtime games become unexplainable.
-A submission that vanishes with no error leaves the client showing a state the
-server does not have, and the player finds out at scoring. Nine lines make every
-failure addressable at the call site.
-
-Socket event contracts (`ClientToServerEvents`, `ServerToClientEvents`) are typed
-in `@nome-terra/shared` and imported by both sides, so an event name or payload
-change is a compile error rather than a silent no-op.
+Guardrail tests are used where a convention matters more than a unit:
+`prismaImports.guardrail.test.ts` and `theme.guardrail.test.ts` fail the build
+when someone imports around a boundary rather than through it.
 
 ## Structure
 
 ```
+nome-terra-shared/src/game-core/   scoring · grouping · review · validate
+                                   normalize · letters · stop · blocklist
 nome-terra-backend/src/
-  realtime/
-    socketServer.ts          adapter setup, boot
-    gateways/gameGateway.ts
-    gateways/handlers/       lobby · rooms · round · game · disconnect
-    context/socketRegistry.ts
-    redis/redisClient.ts
-  modules/game/
-    repositories/            roomRepo · redisRoomRepo · createRoomRepo
-    services/                seasonService · playerSeasonStatsService
-    history/ playerProfile/ stats/
-  api/game/                  rooms · seasons · stats · social · history · profile
+  realtime/gateways/handlers/      lobby · rooms · round · game · disconnect
+  modules/game/                    gameService · roomService · lobbyService
+                                   presenceService · roundLock · redisRoundLock
+                                   idempotency · history · stats
+  api/game/                        rooms · seasons · stats · social · profile
+nome-terra-web/src/features/       game · lobby · history · stats · profile
+nome-terra-mobile/                 Expo Router
 ```
 
-Handlers are split by lifecycle stage rather than kept in one connection handler,
-because the round handlers are where the real complexity is and they should not
-share a file with lobby chat.
-
-Alongside the game: seasons, player profiles, per-season stats, match history,
-social features, analytics, and an OpenAPI-documented REST surface for everything
-that is not realtime.
+Docker Compose for staging and production. Biome for lint and format.
 
 ## Known limitations
 
-**Lock coverage is partial.** Round mutations are serialised by a distributed
-mutex — `RedisRoundLock` uses `SET NX PX` with a random token and releases via a
-Lua compare-and-delete, so a lock that expires cannot be released by its previous
-holder. It wraps `submit`, `vote`, `endRound`, `stopRound`, `finalizeRound`,
-`pickLetterAndStartRound` and `sendReaction`.
+**The room store has no version field.** Correctness depends on every write path
+taking the lock. The naming convention and the race test make that hard to get
+wrong, but it is a convention enforced by review rather than a property enforced
+by the database.
 
-It does not wrap `startGame`, `startNextRound`, `forceEndRound`, `endGame` or
-`cleanupRoom`. Those are lower-frequency transitions, usually host-initiated, so
-the collision window is small — but the room store underneath is
-read-modify-write with no version field, so outside the lock two instances can
-still lose an update. Extending the lock to the remaining transitions is the next
-piece of work.
+**The mobile package is not in the workspace build.** It is commented out of
+`pnpm-workspace.yaml`, so it is not typechecked or tested in CI with the rest.
 
-**Test coverage is uneven.** Auth, error handling, request logging, health check
-and the OpenAPI router are tested; the scoring engine and round lifecycle are
-not. That is backwards — scoring is the part players would notice being wrong.
-
-## Roadmap
-
-|                                                    | Status                      |
-| -------------------------------------------------- | --------------------------- |
-| Realtime rounds, voting, scoring, seasons, stats   | Live in beta                |
-| Redis adapter for multi-instance fanout            | Built                       |
-| Redis-backed room state with TTL                   | Built                       |
-| Distributed round lock on high-frequency mutations | Built                       |
-| Lock coverage for host-initiated transitions       | Not built — see limitations |
-| Scoring engine test suite                          | Not built                   |
-| Matchmaking beyond room codes                      | Not started                 |
+**Lock waits are unbounded in effect.** `acquireRoundLockWaiting` retries until
+it gets the lock; a pathologically slow holder delays callers rather than failing
+them fast.
 
 ## Documents
 
-|                                          |                                                                                |
-| ---------------------------------------- | ------------------------------------------------------------------------------ |
-| [Realtime model](docs/realtime-model.md) | Authority, room lifecycle, state ownership, the Redis store and the round lock |
-| [Decisions](docs/decisions.md)           | Each choice with the alternative rejected and the cost accepted                |
+|                                          |                                                                              |
+| ---------------------------------------- | ---------------------------------------------------------------------------- |
+| [Realtime model](docs/realtime-model.md) | Authority, the shared rules layer, room lifecycle, state ownership, the lock |
+| [Decisions](docs/decisions.md)           | Each choice with the alternative rejected and the cost accepted              |
 
 ---
-
-## Repository note
 
 This repository contains architecture documentation only. The implementation is
 private.
