@@ -22,8 +22,9 @@ players know the rules and will not forgive wrong scores.
 instance permanently. Also rejected: rooms in PostgreSQL, which gives durability
 nobody needs for a transient lobby and adds write load per submission.
 
-**Cost:** every room read is a network hop and a deserialize, and the
-read-modify-write cycle is not yet version-guarded. See
+**Cost:** every room read is a network hop and a deserialize, and the store
+itself has no version field — the read-modify-write cycle is made safe by a
+separate distributed lock rather than by the store. See
 [realtime-model.md](realtime-model.md).
 
 ## TTL instead of explicit room cleanup
@@ -50,6 +51,26 @@ report costs hours.
 
 **Cost:** a misconfigured deploy fails to start rather than starting degraded.
 That is the intended trade.
+
+## A distributed lock rather than a versioned store
+
+**Chosen:** serialise round mutations with `RedisRoundLock` — `SET NX PX` with a
+random token, released by a Lua compare-and-delete.
+
+**Rejected:** adding a `version` field to the room and retrying on conflict.
+That is the textbook answer and it would work, but a round transition touches
+several keys and involves timers; retrying the whole transition on a version
+clash means re-deriving state that has already been partly acted on. A mutex
+makes the critical section explicit instead.
+
+**Why the token:** the TTL is there so a crashed holder cannot wedge a room
+forever. But a TTL introduces its own race — a holder that has already expired
+must not delete a lock a different instance now owns. Comparing the token before
+deleting closes it.
+
+**Cost:** a lock is a serialisation point, so the high-frequency paths are no
+longer concurrent within a room. At the scale of one lobby that is free.
+Coverage is also partial, which is stated in the limitations.
 
 ## Acknowledgements on every client-to-server event
 
@@ -81,8 +102,10 @@ membership guarantees the file becomes unreadable.
 
 ## What I would change
 
-**Version-guarded room writes.** Add a `version` field, `WATCH` the key, retry on
-conflict. Required before running multiple instances under real concurrency.
+**Extend the round lock to the remaining transitions.** `startGame`,
+`startNextRound`, `forceEndRound`, `endGame` and `cleanupRoom` are not yet
+serialised, so they remain exposed to the read-modify-write race that the lock
+removes everywhere else.
 
 **Test the scoring engine.** Current tests cover auth, error handling, logging,
 health and OpenAPI routing — the infrastructure. Scoring and round lifecycle,

@@ -67,7 +67,7 @@ pnpm workspace with three packages: `nome-terra-backend`, `nome-terra-web`
 
 ## Three things worth reading about
 
-### Room state lives in Redis behind a repository interface
+### Room state lives in Redis, behind a repository interface and a lock
 
 Room state is not in process memory. `RoomRepo` is an interface with two
 implementations — `InMemoryRoomRepo` for local development and `RedisRoomRepo`
@@ -163,13 +163,18 @@ that is not realtime.
 
 ## Known limitations
 
-**Room writes are not version-guarded.** `RedisRoomRepo` uses `MULTI` for
-atomic multi-key writes, but room mutation is read-modify-write with no `WATCH`
-or version field. Two instances handling concurrent submissions to the same room
-can lose an update. In practice a room's players are usually on one instance and
-the window is small, but this is the thing that would need fixing before running
-multiple instances under real load — and it is the one place where the
-horizontal-scaling story is currently incomplete.
+**Lock coverage is partial.** Round mutations are serialised by a distributed
+mutex — `RedisRoundLock` uses `SET NX PX` with a random token and releases via a
+Lua compare-and-delete, so a lock that expires cannot be released by its previous
+holder. It wraps `submit`, `vote`, `endRound`, `stopRound`, `finalizeRound`,
+`pickLetterAndStartRound` and `sendReaction`.
+
+It does not wrap `startGame`, `startNextRound`, `forceEndRound`, `endGame` or
+`cleanupRoom`. Those are lower-frequency transitions, usually host-initiated, so
+the collision window is small — but the room store underneath is
+read-modify-write with no version field, so outside the lock two instances can
+still lose an update. Extending the lock to the remaining transitions is the next
+piece of work.
 
 **Test coverage is uneven.** Auth, error handling, request logging, health check
 and the OpenAPI router are tested; the scoring engine and round lifecycle are
@@ -177,21 +182,22 @@ not. That is backwards — scoring is the part players would notice being wrong.
 
 ## Roadmap
 
-|                                                  | Status                      |
-| ------------------------------------------------ | --------------------------- |
-| Realtime rounds, voting, scoring, seasons, stats | Live in beta                |
-| Redis adapter for multi-instance fanout          | Built                       |
-| Redis-backed room state with TTL                 | Built                       |
-| Optimistic concurrency on room writes            | Not built — see limitations |
-| Scoring engine test suite                        | Not built                   |
-| Matchmaking beyond room codes                    | Not started                 |
+|                                                    | Status                      |
+| -------------------------------------------------- | --------------------------- |
+| Realtime rounds, voting, scoring, seasons, stats   | Live in beta                |
+| Redis adapter for multi-instance fanout            | Built                       |
+| Redis-backed room state with TTL                   | Built                       |
+| Distributed round lock on high-frequency mutations | Built                       |
+| Lock coverage for host-initiated transitions       | Not built — see limitations |
+| Scoring engine test suite                          | Not built                   |
+| Matchmaking beyond room codes                      | Not started                 |
 
 ## Documents
 
-|                                          |                                                                                     |
-| ---------------------------------------- | ----------------------------------------------------------------------------------- |
-| [Realtime model](docs/realtime-model.md) | Authority, room lifecycle, state ownership, the Redis store and its concurrency gap |
-| [Decisions](docs/decisions.md)           | Each choice with the alternative rejected and the cost accepted                     |
+|                                          |                                                                                |
+| ---------------------------------------- | ------------------------------------------------------------------------------ |
+| [Realtime model](docs/realtime-model.md) | Authority, room lifecycle, state ownership, the Redis store and the round lock |
+| [Decisions](docs/decisions.md)           | Each choice with the alternative rejected and the cost accepted                |
 
 ---
 
